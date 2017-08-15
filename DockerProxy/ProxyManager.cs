@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using DockerProxy.Docker;
@@ -23,12 +21,19 @@ namespace DockerProxy
         }
 
         public async Task StartAsync()
-        {
+        {          
             while (!_shutdown.IsCancellationRequested)
-            {
-                var containers = await DockerClient.ContainerListAsync();
-                await ProcessContainersAsync(containers);
-                await Task.Delay(5000, _shutdown);
+            {     
+                try
+                {
+                    var containers = await DockerClient.ContainerListAsync();
+                    await ProcessContainersAsync(containers);
+                    await Task.Delay(5000, _shutdown);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex);
+                }
             }
         }
 

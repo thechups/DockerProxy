@@ -87,18 +87,21 @@ namespace DockerProxy
         private async Task ProxyAsync(int hostPort, int containerPort)
         {
             //TODO: CONTAINER IP
-            var nat = Container.NetworkSettings.Networks["nat"];
-
-            var ip = nat.IPAddress;
-            Logger.Information("Proxying - localhost:{0} -> {1}:{2}", hostPort, ip, containerPort);
-            using (var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+            foreach (var network in Container.NetworkSettings.Networks.Keys)
             {
-                listener.Bind(new IPEndPoint(IPAddress.Loopback, hostPort));
-                listener.Listen(5);
-                while (!_cancellation.IsCancellationRequested)
+                var net = Container.NetworkSettings.Networks[network];
+
+                var ip = net.IPAddress;
+                Logger.Information("Proxying - {4} - localhost:{0} -> {3} -> {1}:{2}", hostPort, ip, containerPort, network, Container.Name);
+                using (var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
                 {
-                    var client = await listener.AcceptAsync();
-                    _connectionTasks.Add(HandleClientAsync(client, ip, containerPort));
+                    listener.Bind(new IPEndPoint(IPAddress.Loopback, hostPort));
+                    listener.Listen(5);
+                    while (!_cancellation.IsCancellationRequested)
+                    {
+                        var client = await listener.AcceptAsync();
+                        _connectionTasks.Add(HandleClientAsync(client, ip, containerPort));
+                    }
                 }
             }
         }
