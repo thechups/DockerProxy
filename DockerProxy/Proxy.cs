@@ -3,180 +3,212 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+
 using DockerProxy.Docker;
+
 using Serilog;
+
 using Stateless;
 
 namespace DockerProxy
 {
-    public class Proxy : IDisposable
-    {
-        private readonly StateMachine<State, Trigger> _machine;
-        private readonly StateMachine<State, Trigger>.TriggerWithParameters<Container> _openTrigger;
-        private readonly CancellationTokenSource _cancellation;
-        private readonly List<Task> _proxyTasks = new List<Task>();
-        private readonly List<Task> _connectionTasks = new List<Task>();
-        private readonly TaskCompletionSource<bool> _closed = new TaskCompletionSource<bool>();
+	public class Proxy : IDisposable
+	{
+		private static readonly ILogger Logger = Log.ForContext<Proxy>();
 
-        public Container Container { get; private set; }
-        public Dictionary<string, PortBinding[]> PortBindings => Container?.HostConfig.PortBindings;
-        public Task Closed => _closed.Task;
+		private readonly CancellationTokenSource _cancellation;
 
-        private static readonly ILogger Logger = Log.ForContext<Proxy>();
-        private long _sentBytes;
-        private long _receivedBytes;
+		private readonly TaskCompletionSource<bool> _closed = new TaskCompletionSource<bool>();
 
-        public Proxy(CancellationToken shutdown)
-        {
-            _cancellation = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
-            _cancellation.Token.Register(() => _closed.SetCanceled());
+		private readonly List<Task> _connectionTasks = new List<Task>();
 
-            _machine = new StateMachine<State, Trigger>(State.Initial);
-            _machine.OnTransitioned(transition => Logger.Debug("Transition: {0} -> ({1}) -> {2}", transition.Source, transition.Trigger, transition.Destination));
-            _openTrigger = _machine.SetTriggerParameters<Container>(Trigger.Open);
+		private readonly StateMachine<State, Trigger> _machine;
 
-            _machine
-                .Configure(State.Initial)
-                .Permit(Trigger.Open, State.Open);
+		private readonly StateMachine<State, Trigger>.TriggerWithParameters<Container> _openTrigger;
 
-            _machine.Configure(State.Open)
-                .Permit(Trigger.Close, State.Closed)
-                .OnEntryFrom(_openTrigger, OnOpen);
+		private readonly List<Task> _proxyTasks = new List<Task>();
 
-            _machine.Configure(State.Closed)
-                .OnEntry(OnClose);
-        }
+		private long _receivedBytes;
 
-        public void Dispose()
-        {
-            _cancellation.Cancel();
-            if (!Task.WaitAll(_proxyTasks.Union(_connectionTasks).ToArray(), 5000))
-            {
-                Logger.Warning(
-                    "Error cleaning up proxy and connection tasks for {0}\r\nProxy Tasks:\r\n{1}\r\nConnection Tasks:\r\n{2}",
-                    Container.Name,
-                    String.Join(", ", _proxyTasks.Select(t => t.Status)),
-                    String.Join(", ", _connectionTasks.Select(t => t.Status)));
-            }
-            else
-            {
-                Logger.Debug("Proxy completed receiving {0:0.00} MB and sending {1:0.00} MB", _receivedBytes / 1024.0 / 1024, _sentBytes / 1024.0 / 1024);
-            }
-        }
+		private long _sentBytes;
 
-        void OnClose()
-        {
-            _closed.SetResult(true);
-        }
+		public Proxy(CancellationToken shutdown)
+		{
+			_cancellation = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+			_cancellation.Token.Register(() => _closed.SetCanceled());
 
-        void OnOpen(Container container)
-        {
-            Container = container;
-            //Only proxying TCP, need to support UDP?
-            _proxyTasks.AddRange(PortBindings.Where(e => e.Key.EndsWith("/tcp"))
-                .SelectMany(e =>
-                {
-                    var containerPort = int.Parse(e.Key.Split('/')[0]);
-                    return e.Value.Select(pb => ProxyAsync(pb.HostPort, containerPort));
-                }));
-        }
+			_machine = new StateMachine<State, Trigger>(State.Initial);
+			_machine.OnTransitioned(
+				transition => Logger.Debug(
+					"Transition: {0} -> ({1}) -> {2}",
+					transition.Source,
+					transition.Trigger,
+					transition.Destination));
+			_openTrigger = _machine.SetTriggerParameters<Container>(Trigger.Open);
 
-        private async Task ProxyAsync(int hostPort, int containerPort)
-        {
-            //TODO: CONTAINER IP
-            foreach (var network in Container.NetworkSettings.Networks.Keys)
-            {
-                var net = Container.NetworkSettings.Networks[network];
+			_machine.Configure(State.Initial).Permit(Trigger.Open, State.Open);
 
-                var ip = net.IPAddress;
-                Logger.Information("Proxying - {4} - localhost:{0} -> {3} -> {1}:{2}", hostPort, ip, containerPort, network, Container.Name);
-                using (var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
-                {
-                    listener.Bind(new IPEndPoint(IPAddress.Loopback, hostPort));
-                    listener.Listen(5);
-                    while (!_cancellation.IsCancellationRequested)
-                    {
-                        var client = await listener.AcceptAsync();
-                        _connectionTasks.Add(HandleClientAsync(client, ip, containerPort));
-                    }
-                }
-            }
-        }
+			_machine.Configure(State.Open).Permit(Trigger.Close, State.Closed).OnEntryFrom(_openTrigger, OnOpen);
 
-        private async Task HandleClientAsync(Socket client, string ip, int containerPort)
-        {
-            using (client)
-            {
-                using (var docker = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
-                {
-                    await docker.ConnectAsync(ip, containerPort);
-                    _cancellation.Token.Register(() =>
-                    {
-                        client.Dispose();
-                        docker.Dispose();
-                    });
+			_machine.Configure(State.Closed).OnEntry(OnClose);
+		}
 
-                    var incoming = ProxyAsync(client, docker);
-                    var outgoing = ProxyAsync(docker, client);
+		private enum State
+		{
+			Initial,
 
-                    try
-                    {
-                        var result = await Task.WhenAll(incoming, outgoing);
-                    }
-                    catch (Exception)
-                    {
-                    }
-                    _receivedBytes += incoming.Result;
-                    _sentBytes += outgoing.Result;
-                }
-            }
-        }
+			Open,
 
-        private async Task<long> ProxyAsync(Socket from, Socket to)
-        {
-            long ret = 0;
-            var buffer = new ArraySegment<byte>(new byte[16384], 0, 16384);
-            try
-            {
-                while (from.Connected && to.Connected)
-                {
-                    var read = await from.ReceiveAsync(buffer, SocketFlags.None);
-                    ret += read;
-                    if (read == 0)
-                        return ret;
-                    await to.SendAsync(new ArraySegment<byte>(buffer.Array, 0, read), SocketFlags.None);
-                }
-            }
-            catch (Exception)
-            {
-            }
-            return ret;
-        }
+			Closed
+		}
 
-        public Task OpenAsync(Container container)
-        {
-            return _machine.FireAsync(_openTrigger, container);
-        }
+		private enum Trigger
+		{
+			Open,
 
-        public Task CloseAsync()
-        {
-            return _machine.FireAsync(Trigger.Close);
-        }
+			Close
+		}
 
-        enum State
-        {
-            Initial,
-            Open,
-            Closed
-        }
+		public Task Closed => _closed.Task;
 
-        enum Trigger
-        {
-            Open,
-            Close
-        }
-    }
+		public Container Container { get; private set; }
+
+		public Dictionary<string, PortBinding[]> PortBindings => Container?.HostConfig.PortBindings;
+
+		public Task CloseAsync()
+		{
+			return _machine.FireAsync(Trigger.Close);
+		}
+
+		public void Dispose()
+		{
+			_cancellation.Cancel();
+			if (!Task.WaitAll(_proxyTasks.Union(_connectionTasks).ToArray(), 5000))
+			{
+				Logger.Warning(
+					"Error cleaning up proxy and connection tasks for {0}\r\nProxy Tasks:\r\n{1}\r\nConnection Tasks:\r\n{2}",
+					Container.Name,
+					string.Join(", ", _proxyTasks.Select(t => t.Status)),
+					string.Join(", ", _connectionTasks.Select(t => t.Status)));
+			}
+			else
+			{
+				Logger.Debug(
+					"Proxy completed receiving {0:0.00} MB and sending {1:0.00} MB",
+					_receivedBytes / 1024.0 / 1024,
+					_sentBytes / 1024.0 / 1024);
+			}
+		}
+
+		public Task OpenAsync(Container container)
+		{
+			return _machine.FireAsync(_openTrigger, container);
+		}
+
+		private async Task HandleClientAsync(Socket client, string ip, int containerPort)
+		{
+			using (client)
+			{
+				using (var docker = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+				{
+					await docker.ConnectAsync(ip, containerPort);
+					_cancellation.Token.Register(
+						() =>
+							{
+								client.Dispose();
+								docker.Dispose();
+							});
+
+					var incoming = ProxyAsync(client, docker);
+					var outgoing = ProxyAsync(docker, client);
+
+					try
+					{
+						var result = await Task.WhenAll(incoming, outgoing);
+					}
+					catch (Exception ex)
+					{
+						Logger.Error(ex, "Something went wrong.");
+					}
+
+					_receivedBytes += incoming.Result;
+					_sentBytes += outgoing.Result;
+				}
+			}
+		}
+
+		private void OnClose()
+		{
+			_closed.SetResult(true);
+		}
+
+		private void OnOpen(Container container)
+		{
+			Container = container;
+
+			// Only proxying TCP, need to support UDP?
+			_proxyTasks.AddRange(
+				PortBindings.Where(e => e.Key.EndsWith("/tcp")).SelectMany(
+					e =>
+						{
+							var containerPort = int.Parse(e.Key.Split('/')[0]);
+							return e.Value.Select(pb => ProxyAsync(pb.HostPort, containerPort));
+						}));
+		}
+
+		private async Task ProxyAsync(int hostPort, int containerPort)
+		{
+			// TODO: CONTAINER IP
+			foreach (var network in Container.NetworkSettings.Networks.Keys)
+			{
+				var net = Container.NetworkSettings.Networks[network];
+
+				var ip = net.IPAddress;
+				Logger.Information(
+					"Proxying - {4} - localhost:{0} -> {3} -> {1}:{2}",
+					hostPort,
+					ip,
+					containerPort,
+					network,
+					Container.Name);
+				using (var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+				{
+					listener.Bind(new IPEndPoint(IPAddress.Loopback, hostPort));
+					listener.Listen(5);
+					while (!_cancellation.IsCancellationRequested)
+					{
+						var client = await listener.AcceptAsync();
+						_connectionTasks.Add(HandleClientAsync(client, ip, containerPort));
+					}
+				}
+			}
+		}
+
+		private async Task<long> ProxyAsync(Socket from, Socket to)
+		{
+			long ret = 0;
+			var buffer = new ArraySegment<byte>(new byte[16384], 0, 16384);
+			try
+			{
+				while (from.Connected && to.Connected)
+				{
+					var read = await from.ReceiveAsync(buffer, SocketFlags.None);
+					ret += read;
+					if (read == 0)
+					{
+						return ret;
+					}
+
+					await to.SendAsync(new ArraySegment<byte>(buffer.Array, 0, read), SocketFlags.None);
+				}
+			}
+			catch (SocketException ex)
+			{
+			}
+
+			return ret;
+		}
+	}
 }

@@ -1,11 +1,9 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
+﻿using System.Collections.Generic;
 
 namespace DockerProxy.Docker
 {
-    public class HostConfig
-    {
-        public Dictionary<string, PortBinding[]> PortBindings { get; set; }
-    }
+	public class HostConfig
+	{
+		public Dictionary<string, PortBinding[]> PortBindings { get; set; }
+	}
 }

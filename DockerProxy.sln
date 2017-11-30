@@ -1,9 +1,9 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio 15
-VisualStudioVersion = 15.0.26403.7
+VisualStudioVersion = 15.0.27004.2010
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DockerProxy", "DockerProxy\DockerProxy.csproj", "{675C3082-1094-4134-9BAC-8E167D63E1E7}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DockerProxy", "DockerProxy\DockerProxy.csproj", "{675C3082-1094-4134-9BAC-8E167D63E1E7}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -18,5 +18,8 @@ Global
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {39B3A9B4-771A-4D6C-A936-39331934FCF1}
 	EndGlobalSection
 EndGlobal
