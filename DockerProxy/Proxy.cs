@@ -6,7 +6,7 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 
-using DockerProxy.Docker;
+using Docker.DotNet.Models;
 
 using Serilog;
 
@@ -26,7 +26,7 @@ namespace DockerProxy
 
 		private readonly StateMachine<State, Trigger> _machine;
 
-		private readonly StateMachine<State, Trigger>.TriggerWithParameters<Container> _openTrigger;
+		private readonly StateMachine<State, Trigger>.TriggerWithParameters<ContainerListResponse> _openTrigger;
 
 		private readonly List<Task> _proxyTasks = new List<Task>();
 
@@ -46,7 +46,8 @@ namespace DockerProxy
 					transition.Source,
 					transition.Trigger,
 					transition.Destination));
-			_openTrigger = _machine.SetTriggerParameters<Container>(Trigger.Open);
+
+			_openTrigger = _machine.SetTriggerParameters<ContainerListResponse>(Trigger.Open);
 
 			_machine.Configure(State.Initial).Permit(Trigger.Open, State.Open);
 
@@ -73,9 +74,9 @@ namespace DockerProxy
 
 		public Task Closed => _closed.Task;
 
-		public Container Container { get; private set; }
+		public ContainerListResponse Container { get; private set; }
 
-		public Dictionary<string, PortBinding[]> PortBindings => Container?.HostConfig.PortBindings;
+		public IList<Port> PortBindings => Container?.Ports;
 
 		public Task CloseAsync()
 		{
@@ -89,7 +90,7 @@ namespace DockerProxy
 			{
 				Logger.Warning(
 					"Error cleaning up proxy and connection tasks for {0}\r\nProxy Tasks:\r\n{1}\r\nConnection Tasks:\r\n{2}",
-					Container.Name,
+					Container.Name(),
 					string.Join(", ", _proxyTasks.Select(t => t.Status)),
 					string.Join(", ", _connectionTasks.Select(t => t.Status)));
 			}
@@ -102,7 +103,7 @@ namespace DockerProxy
 			}
 		}
 
-		public Task OpenAsync(Container container)
+		public Task OpenAsync(ContainerListResponse container)
 		{
 			return _machine.FireAsync(_openTrigger, container);
 		}
@@ -144,21 +145,17 @@ namespace DockerProxy
 			_closed.SetResult(true);
 		}
 
-		private void OnOpen(Container container)
+		private void OnOpen(ContainerListResponse container)
 		{
 			Container = container;
 
 			// Only proxying TCP, need to support UDP?
 			_proxyTasks.AddRange(
-				PortBindings.Where(e => e.Key.EndsWith("/tcp")).SelectMany(
-					e =>
-						{
-							var containerPort = int.Parse(e.Key.Split('/')[0]);
-							return e.Value.Select(pb => ProxyAsync(pb.HostPort, containerPort));
-						}));
+				PortBindings.Where(e => e.Type.EndsWith("tcp"))
+					.Select(e => ProxyAsync(e.PublicPort, e.PrivatePort)));
 		}
 
-		private async Task ProxyAsync(int hostPort, int containerPort)
+		private async Task ProxyAsync(ushort hostPort, ushort containerPort)
 		{
 			// TODO: CONTAINER IP
 			foreach (var network in Container.NetworkSettings.Networks.Keys)
@@ -172,7 +169,7 @@ namespace DockerProxy
 					ip,
 					containerPort,
 					network,
-					Container.Name);
+					Container.Name());
 				using (var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
 				{
 					listener.Bind(new IPEndPoint(IPAddress.Loopback, hostPort));
@@ -206,6 +203,7 @@ namespace DockerProxy
 			}
 			catch (SocketException ex)
 			{
+				Logger.Warning(ex, ex.Message);
 			}
 
 			return ret;

@@ -1,18 +1,22 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
-using DockerProxy.Docker;
+using Docker.DotNet;
+using Docker.DotNet.Models;
 
 using Serilog;
 
 namespace DockerProxy
 {
-	public class ProxyManager
+	public class ProxyManager : IDisposable
 	{
 		private static readonly ILogger Logger = Log.ForContext<ProxyManager>();
+
+		private readonly DockerClient _dockerClient;
 
 		private readonly ConcurrentDictionary<string, Proxy> _proxies = new ConcurrentDictionary<string, Proxy>();
 
@@ -21,18 +25,24 @@ namespace DockerProxy
 		public ProxyManager(CancellationToken shutdown)
 		{
 			_shutdown = shutdown;
+			_dockerClient = new DockerClientConfiguration(new Uri("npipe://./pipe/docker_engine")).CreateClient();
 		}
 
-		public async Task ProcessContainersAsync(Container[] containers)
+		public void Dispose()
 		{
-			var added = containers.Where(c => !_proxies.ContainsKey(c.Id)).ToList();
-			var removed = _proxies.Where(p => containers.All(c => c.Id != p.Key)).ToList();
+			_dockerClient?.Dispose();
+		}
+
+		public async Task ProcessContainersAsync(IList<ContainerListResponse> containers)
+		{
+			var added = containers.Where(c => !_proxies.ContainsKey(c.ID)).ToList();
+			var removed = _proxies.Where(p => containers.All(c => c.ID != p.Key)).ToList();
 
 			foreach (var remove in removed)
 			{
 				Logger.Information(
 					"Removing Container: {@Container}",
-					new { remove.Value.Container.Name, remove.Value.Container.Config.Image });
+					new { Name = remove.Value.Container.Name(), remove.Value.Container.Image });
 
 				if (!_proxies.TryRemove(remove.Key, out var proxy))
 				{
@@ -44,13 +54,13 @@ namespace DockerProxy
 
 			foreach (var add in added)
 			{
-				Logger.Information("Adding Container: {@Container}", new { add.Name, add.Config.Image });
+				Logger.Information("Adding Container: {@Container}", new { Name = add.Name(), add.Image });
 				var task = Task.Run(
 					async () =>
 						{
 							using (var proxy = new Proxy(_shutdown))
 							{
-								_proxies[add.Id] = proxy;
+								_proxies[add.ID] = proxy;
 								await proxy.OpenAsync(add);
 								await proxy.Closed;
 							}
@@ -65,7 +75,7 @@ namespace DockerProxy
 			{
 				try
 				{
-					var containers = await DockerClient.ContainerListAsync();
+					var containers = await _dockerClient.Containers.ListContainersAsync(new ContainersListParameters(), _shutdown);
 					await ProcessContainersAsync(containers);
 				}
 				catch (Exception ex)
